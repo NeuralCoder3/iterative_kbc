@@ -15,6 +15,8 @@ The `test_term1` uses the caviar rules (based on halide).
 This term does not involve any constants to make it easier for twee.
 There are simplifications possible like `minus(v0,v0) -> 0`.
 
+`minus(v0,v0) = 0` is not a direct rule but a consequence found using multiple critical pairs.
+
 
 ## TODOs
 
