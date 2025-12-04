@@ -1,39 +1,24 @@
 #!/usr/bin/env python3
 
-import re
 import sys
 import subprocess
-import heapq
 import argparse
+import itertools
 
-# 1. Setup command-line argument parser
-parser = argparse.ArgumentParser(description="Simplify a mathematical term using Twee or a substitution file.")
+parser = argparse.ArgumentParser(
+    description="Simplify terms using Twee",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
 
-# Add -s first, as it changes the requirements
-# parser.add_argument("-s", "--substitution-file", 
-#                     help="A file containing pre-computed substitutions. If given, rule_file and term args are ignored.")
+parser.add_argument("rule_file", help="The .p file containing the rewrite rules.")
 
-parser.add_argument("rule_file", nargs='?', default=None, 
-                    help="The .p file containing the rewrite rules.")
+term_group = parser.add_mutually_exclusive_group(required=True)
+term_group.add_argument("-T", "--term", help="The term string to simplify.")
+term_group.add_argument("-F", "--term-file", help="A file containing the term string to simplify.")
 
-term_group = parser.add_mutually_exclusive_group(required=False)
-term_group.add_argument("-T", "--term", 
-                        help="The term string to simplify.")
-term_group.add_argument("-F", "--term-file", 
-                        help="A file containing the term string to simplify.")
-
-parser.add_argument("-t", "--timeout", default="1", 
-                    help="Timeout for the Twee prover (default: 1 second).")
-# parser.add_argument("-f", "--no-flatten", action="store_false",
-#                     help="Prevents flattening nested functions in the goal term (ignored if -s is used).")
+parser.add_argument( "-t", "--timeout", type=int, default=1, help="Timeout for the Twee prover in seconds.")
 
 args = parser.parse_args()
-
-# --- Validation ---
-if not args.rule_file:
-    parser.error("argument 'rule_file' is required")
-if not args.term and not args.term_file:
-    parser.error("one of the arguments -T/--term or -F/--term-file is required")
 
 class Formula:
     def __init__(self, id, args):
@@ -48,12 +33,9 @@ class Formula:
                 self.value = int(id[3:])
             elif id == id.upper():
                 self.is_var = True
-            # else:
-            #     raise Exception(f"unknown constant: {id}")
         
     def __repr__(self):
         if len(self.args) == 0:
-            # return "?"+self.id if self.is_var else self.id
             return self.id
         else:
             return f"{self.id}({','.join(map(str, self.args))})"
@@ -117,12 +99,11 @@ def replace(term, subst):
 
 
 
-# 2. Get the rule file and timeout from parsed args
 rule_file = args.rule_file
 timeout = args.timeout
 
 
-def execute_twee(twee_file:str, timeout = None):
+def execute_twee(twee_file:str, timeout = None, allow_gaveup = False):
     # if DEBUG env variable is set, print data to file twee_input.p
     import os
     if os.getenv("DEBUG"):
@@ -147,8 +128,9 @@ def execute_twee(twee_file:str, timeout = None):
     end_string = "RESULT: CounterSatisfiable"
     end_string2 = "RESULT: GaveUp"
     assert final_string in output, "Twee did not finish properly\n"+ output
+    if not allow_gaveup:
+        assert end_string in output, "Twee did not finish properly\n"+ output
     output = output.split(final_string)[1]
-    # assert end_string in output, "Twee did not finish properly\n"+ output
     if end_string in output:
         output = output.split(end_string)[0]
     elif end_string2 in output:
@@ -258,17 +240,61 @@ def instantiations(vars:list[str],ground_terms:list):
                 inst[v] = t
                 yield inst
                 
-# for subst in instantiations(["A","B","C"], [1,2,3]):
-#     print("Substitution:", subst)
+                
+signature = {}
+def collect_signature(term, signature=signature):
+    arity = len(term.args)
+    signature.setdefault(arity, set()).add(term.id)
+    for arg in term.args:
+        collect_signature(arg, signature)
+        
+for r in rules:
+    name, (lhs, rhs) = r
+    collect_signature(lhs)
+    collect_signature(rhs)
+collect_signature(term)
 
-# subterms.append(parse_formula_assert("mul(a,inv(a))"))
-# subterms.append(parse_formula_assert("mul(inv(a),a)"))
-# subterms.append(parse_formula_assert("mul(inv(inv(a)),inv(a))"))
-# subterms.append(parse_formula_assert("mul(inv(a),inv(inv(a)))"))
+# for arity in signature:
+#     print(f"Function symbols of arity {arity}: {signature[arity]}")
+    
+def partitions(n, k):
+    """Generate all partitions of n into k positive integers."""
+    if k <= 0:
+        return
+    if k == 1:
+        if n >= 1:
+            yield (n,)
+        return
+    for i in range(1, n - k + 2):
+        for tail in partitions(n - i, k - 1):
+            yield (i,) + tail
+    
+def enumerate_subterms(size):
+    for arity in signature:
+        remaining = size - 1
+        if remaining < arity:
+            continue
+        if arity == 0:
+            if size == 1:
+                for func in signature[0]:
+                    yield Formula(func, [])
+            continue
+        for parts in partitions(remaining, arity):
+            assert all(part < size for part in parts)
+            assert sum(parts) == remaining
+            subterm_lists = []
+            for part in parts:
+                subterm_lists.append(list(enumerate_subterms(part)))
+            for args in itertools.product(*subterm_lists):
+                for func in signature[arity]:
+                    yield Formula(func, list(args))
+        
+# for size in range(1,4):
+#     print(f"Enumerating subterms of size {size}:")
+#     for st in enumerate_subterms(size):
+#         print(" ", st)
 
-# subterms.append(parse_formula_assert("inv(inv(a))"))
-# subterms.append(parse_formula_assert("inv(inv(inv(inv(a))))"))
-# subterms.append(parse_formula_assert("mul(inv(inv(inv(a))), mul(inv(inv(a)), one))"))
+sys.stdout.flush()
 
 computed_ground_instances = set()
 grounded_rules = []
@@ -305,7 +331,9 @@ for iter,s in enumerate(subterms):
     # comment in and move left to only execute twee once at end
     # if True:
     
-    print(f"Running Twee with timeout={timeout}s...")
+    print(f"(Current best: {term})")
+    print(f"Running Twee")
+    sys.stdout.flush()
     
     # print("Twee output:")
     # print(output)
@@ -313,7 +341,7 @@ for iter,s in enumerate(subterms):
     #     .split(end_string)[0] \
     #     .strip() \
     #     .splitlines()
-    output = execute_twee(twee_file, None)
+    output = execute_twee(twee_file, None, allow_gaveup=False)
     
     new_term = term
     new_ground_rules = []
@@ -369,13 +397,13 @@ for r in rules:
 twee_file.append(f"cnf(goal,axiom,{term}=goal).")
 twee_file.append("cnf(false,conjecture,num0=num1).")
 
-output = execute_twee(twee_file, timeout)
+output = execute_twee(twee_file, timeout, allow_gaveup=True)
 rules = rules_of_twee_output(output)
 goal_terms = []
 for lhs, rhs in rules:
-    if lhs.id == "goal" and not "goal" in str(rhs):
+    if lhs.id == "goal" and "goal" not in str(rhs):
         goal_terms.append(rhs)
-    if rhs.id == "goal" and not "goal" in str(lhs):
+    if rhs.id == "goal" and "goal" not in str(lhs):
         goal_terms.append(lhs)
         
 print("\nFinal goal terms found:")
@@ -384,3 +412,4 @@ print(min(goal_terms, key=lambda x: (x.size(), str(x))))
 #     print(gt)
     
 # python iter.py group.p -T "inv(inv(a))" -t 10
+# python iter.py group.p -F test_term1.txt -t 10
